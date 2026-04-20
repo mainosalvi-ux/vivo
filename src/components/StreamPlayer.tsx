@@ -85,30 +85,43 @@ export function StreamPlayer({ streamData, isAdmin }: StreamPlayerProps) {
   // WebRTC Logic: Broadcaster (Admin)
   // ==========================================
   
-  // Track active peer connections in a ref
+  // Broadcaster: Track active peer connections and their negotiation status in refs
   const activePcs = useRef<{ [key: string]: RTCPeerConnection }>({});
+  const isNegotiating = useRef<{ [key: string]: boolean }>({});
 
-  // Function to broadcast a track to all active peers
-  const broadcastTrack = async (track: MediaStreamTrack, stream: MediaStream) => {
-    for (const [id, pc] of Object.entries(activePcs.current) as [string, RTCPeerConnection][]) {
-      try {
-        const senders = pc.getSenders();
-        const alreadyExists = senders.some(s => s.track?.id === track.id);
-        if (!alreadyExists) {
-          console.log(`Broadcaster: Adding track ${track.kind} to peer ${id}`);
-          pc.addTrack(track, stream);
-          
-          // Re-negotiate
-          const offer = await pc.createOffer();
-          await pc.setLocalDescription(offer);
-          await updateDoc(doc(db, 'calls', id), { 
-            offer: { type: offer.type, sdp: offer.sdp },
-            updatedAt: serverTimestamp()
-          });
-        }
-      } catch (err) {
-        console.error(`Error in broadcastTrack for ${id}:`, err);
+  const negotiate = async (pc: RTCPeerConnection, callId: string) => {
+    if (isNegotiating.current[callId]) return;
+    
+    try {
+      isNegotiating.current[callId] = true;
+      
+      // Wait for signaling state to be stable before starting a new negotiation
+      if (pc.signalingState !== 'stable') {
+        console.log(`Broadcaster: Waiting for stable state for ${callId}...`);
+        await new Promise(resolve => {
+          const check = () => {
+            if (pc.signalingState === 'stable') resolve(true);
+            else setTimeout(check, 100);
+          };
+          check();
+        });
       }
+
+      console.log(`Broadcaster: Negotiating ${callId}...`);
+      const offer = await pc.createOffer();
+      
+      // Secondary check after async offer creation
+      if (pc.signalingState !== 'stable') return;
+
+      await pc.setLocalDescription(offer);
+      await updateDoc(doc(db, 'calls', callId), { 
+        offer: { type: offer.type, sdp: offer.sdp },
+        updatedAt: serverTimestamp()
+      });
+    } catch (err) {
+      console.error(`Broadcaster: Negotiation error for ${callId}:`, err);
+    } finally {
+      isNegotiating.current[callId] = false;
     }
   };
 
@@ -116,11 +129,31 @@ export function StreamPlayer({ streamData, isAdmin }: StreamPlayerProps) {
   useEffect(() => {
     if (!isAdmin || !streamData?.isActive) return;
     
-    if (localStream) {
-      localStream.getTracks().forEach(t => broadcastTrack(t, localStream));
-    }
-    if (cameraStream) {
-      cameraStream.getTracks().forEach(t => broadcastTrack(t, cameraStream));
+    // Batch track synchronization across all active PCs
+    for (const [id, pc] of Object.entries(activePcs.current) as [string, RTCPeerConnection][]) {
+      let tracksChanged = false;
+      const senders = pc.getSenders();
+
+      // Stable order: Screen share then Camera
+      const streamsToAdd = [
+        { stream: localStream, label: 'screen' },
+        { stream: cameraStream, label: 'camera' }
+      ];
+
+      streamsToAdd.forEach(({ stream }) => {
+        if (!stream) return;
+        stream.getTracks().forEach(track => {
+          if (!senders.some(s => s.track?.id === track.id)) {
+            console.log(`Broadcaster: Syncing track ${track.kind} to peer ${id}`);
+            pc.addTrack(track, stream);
+            tracksChanged = true;
+          }
+        });
+      });
+
+      if (tracksChanged) {
+        negotiate(pc as RTCPeerConnection, id);
+      }
     }
   }, [localStream, cameraStream, isAdmin, streamData?.isActive]);
 
@@ -156,17 +189,17 @@ export function StreamPlayer({ streamData, isAdmin }: StreamPlayerProps) {
 
           setActiveConnections(prev => prev + 1);
 
-          // Add existing tracks immediately
-          if (localStreamRef.current) {
-             localStreamRef.current.getTracks().forEach(t => pc.addTrack(t, localStreamRef.current!));
-          }
-          if (cameraStreamRef.current) {
-             cameraStreamRef.current.getTracks().forEach(t => pc.addTrack(t, cameraStreamRef.current!));
-          }
+          // Set up tracks immediately in stable order
+          const initialStreams = [localStreamRef.current, cameraStreamRef.current];
+          initialStreams.forEach(s => {
+            if (s) s.getTracks().forEach(t => pc.addTrack(t, s));
+          });
 
           pc.onicecandidate = (e) => {
             if (e.candidate) addDoc(collection(db, 'calls', callId, 'offerCandidates'), eventToCandidate(e.candidate));
           };
+
+          pc.onnegotiationneeded = () => negotiate(pc, callId);
 
           pc.onconnectionstatechange = () => {
             console.log(`Broadcaster: Connection ${callId} is ${pc.connectionState}`);
@@ -176,11 +209,12 @@ export function StreamPlayer({ streamData, isAdmin }: StreamPlayerProps) {
             }
           };
 
-          // Signalling
+          // Final Signalling Initial Offer
           const offer = await pc.createOffer();
           await pc.setLocalDescription(offer);
           await updateDoc(doc(db, 'calls', callId), { 
             offer: { type: offer.type, sdp: offer.sdp },
+            createdAt: serverTimestamp(),
             updatedAt: serverTimestamp()
           });
 
@@ -245,11 +279,22 @@ export function StreamPlayer({ streamData, isAdmin }: StreamPlayerProps) {
 
       pc.ontrack = (e) => {
         const s = e.streams[0];
-        if (e.track.kind === 'audio') {
+        const track = e.track;
+        if (track.kind === 'audio') {
           setRemoteMainStream(curr => (curr?.getAudioTracks().length ? curr : s));
-        } else {
-          if (vCount === 0) { setRemoteMainStream(s); vCount = 1; }
-          else { setRemoteCameraStream(s); vCount = 2; }
+          return;
+        }
+
+        // Use track labels or indices to distinguish between screen and camera
+        // In our stable order: Screen is added first
+        console.log(`Spectator: Received track ${track.id} (${track.label})`);
+        
+        if (vCount === 0) {
+          setRemoteMainStream(s);
+          vCount = 1;
+        } else if (vCount === 1) {
+          setRemoteCameraStream(s);
+          vCount = 2;
         }
       };
 
@@ -267,17 +312,27 @@ export function StreamPlayer({ streamData, isAdmin }: StreamPlayerProps) {
         const sd = snap.data();
         if (pc && pc.signalingState !== "closed" && sd?.offer) {
           try {
-             // Only set if different or if we are ready for a new offer
+             // Wait for stable before setting remote offer
+             if (pc.signalingState !== 'stable' && pc.signalingState !== 'have-remote-offer') {
+                await new Promise(resolve => {
+                  const check = () => {
+                    if (pc!.signalingState === 'stable') resolve(true);
+                    else setTimeout(check, 100);
+                  };
+                  check();
+                });
+             }
+
              const isNewOffer = !pc.remoteDescription || pc.remoteDescription.sdp !== sd.offer.sdp;
              if (isNewOffer) {
-                console.log("Spectator: Updating Signal Data...");
+                console.log("Spectator: Syncing Remote Offer...");
                 await pc.setRemoteDescription(new RTCSessionDescription(sd.offer));
                 const answer = await pc.createAnswer();
                 await pc.setLocalDescription(answer);
                 await updateDoc(doc(db, 'calls', callId!), { answer: { type: answer.type, sdp: answer.sdp } });
              }
           } catch (err) {
-             console.error("Spectator: Signal Sync Fail:", err);
+             console.error("Spectator: signal sync fail:", err);
           }
         }
       });
