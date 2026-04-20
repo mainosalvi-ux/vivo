@@ -1,6 +1,6 @@
 {
   "name": "StreamLine",
   "description": "Una plataforma de streaming en vivo con chat real, estadísticas de espectador y controles de administrador.",
-  "requestFramePermissions": ["camera", "microphone", "display-capture"],
+  "requestFramePermissions": ["camera", "microphone", "display-capture", "autoplay"],
   "majorCapabilities": ["live_streaming", "real_time_chat"]
 }

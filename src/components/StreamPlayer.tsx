@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef } from 'react';
-import { Camera, ScreenShare, VideoOff, Maximize2, Radio } from 'lucide-react';
+import { Camera, ScreenShare, VideoOff, Maximize2, Radio, Play, TrendingUp } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import { collection, onSnapshot, addDoc, doc, setDoc, getDoc, updateDoc, deleteDoc, query, where, serverTimestamp } from 'firebase/firestore';
 import { db } from '../lib/firebase';
@@ -13,6 +13,9 @@ const ICE_SERVERS = {
   iceServers: [
     { urls: 'stun:stun.l.google.com:19302' },
     { urls: 'stun:stun1.l.google.com:19302' },
+    { urls: 'stun:stun2.l.google.com:19302' },
+    { urls: 'stun:stun3.l.google.com:19302' },
+    { urls: 'stun:stun4.l.google.com:19302' },
   ],
 };
 
@@ -31,15 +34,15 @@ export function StreamPlayer({ streamData, isAdmin }: StreamPlayerProps) {
   const viewerMainVideoRef = useRef<HTMLVideoElement>(null);
   const viewerPipVideoRef = useRef<HTMLVideoElement>(null);
 
-  // Broadcaster: Track active listener connections
-  const pcs = useRef<{ [key: string]: RTCPeerConnection }>({});
-  
   // Storage for currently active streams to be used inside the signalling effect
   const localStreamRef = useRef<MediaStream | null>(null);
   const cameraStreamRef = useRef<MediaStream | null>(null);
 
   useEffect(() => { localStreamRef.current = localStream; }, [localStream]);
   useEffect(() => { cameraStreamRef.current = cameraStream; }, [cameraStream]);
+
+  // Broadcaster: Track statistics
+  const [activeConnections, setActiveConnections] = useState(0);
 
   // Sync main screen share
   useEffect(() => {
@@ -49,19 +52,17 @@ export function StreamPlayer({ streamData, isAdmin }: StreamPlayerProps) {
     }
   }, [localStream]);
 
-  // Sync camera (Main view)
+  // Sync camera
   useEffect(() => {
-    if (mainCameraRef.current && cameraStream && !localStream) {
-      mainCameraRef.current.srcObject = cameraStream;
-      mainCameraRef.current.play().catch(e => console.error("Camera main play fail:", e));
-    }
-  }, [cameraStream, localStream]);
-
-  // Sync camera (PiP view)
-  useEffect(() => {
-    if (pipCameraRef.current && cameraStream && localStream) {
-      pipCameraRef.current.srcObject = cameraStream;
-      pipCameraRef.current.play().catch(e => console.error("Camera PiP play fail:", e));
+    const activeCamera = cameraStream;
+    if (activeCamera) {
+       if (pipCameraRef.current && localStream) {
+          pipCameraRef.current.srcObject = activeCamera;
+          pipCameraRef.current.play().catch(e => console.error("PiP play fail:", e));
+       } else if (mainCameraRef.current && !localStream) {
+          mainCameraRef.current.srcObject = activeCamera;
+          mainCameraRef.current.play().catch(e => console.error("Main cam play fail:", e));
+       }
     }
   }, [cameraStream, localStream]);
 
@@ -83,81 +84,152 @@ export function StreamPlayer({ streamData, isAdmin }: StreamPlayerProps) {
   // ==========================================
   // WebRTC Logic: Broadcaster (Admin)
   // ==========================================
+  
+  // Track active peer connections in a ref
+  const activePcs = useRef<{ [key: string]: RTCPeerConnection }>({});
+
+  // Function to broadcast a track to all active peers
+  const broadcastTrack = async (track: MediaStreamTrack, stream: MediaStream) => {
+    for (const [id, pc] of Object.entries(activePcs.current) as [string, RTCPeerConnection][]) {
+      try {
+        const senders = pc.getSenders();
+        const alreadyExists = senders.some(s => s.track?.id === track.id);
+        if (!alreadyExists) {
+          console.log(`Broadcaster: Adding track ${track.kind} to peer ${id}`);
+          pc.addTrack(track, stream);
+          
+          // Re-negotiate
+          const offer = await pc.createOffer();
+          await pc.setLocalDescription(offer);
+          await updateDoc(doc(db, 'calls', id), { 
+            offer: { type: offer.type, sdp: offer.sdp },
+            updatedAt: serverTimestamp()
+          });
+        }
+      } catch (err) {
+        console.error(`Error in broadcastTrack for ${id}:`, err);
+      }
+    }
+  };
+
+  // Effect to handle new tracks being added while people are already watching
   useEffect(() => {
     if (!isAdmin || !streamData?.isActive) return;
-
-    console.log("Admin listening for viewer calls (stabilized)...");
-
-    // Listen for incoming viewer connection requests ("calls")
-    const docThreshold = new Date(Date.now() - 300000); // 5 mins ago
-    const q = query(collection(db, 'calls'), where('createdAt', '>=', docThreshold));
     
-    const unsubscribe = onSnapshot(q, (snapshot) => {
+    if (localStream) {
+      localStream.getTracks().forEach(t => broadcastTrack(t, localStream));
+    }
+    if (cameraStream) {
+      cameraStream.getTracks().forEach(t => broadcastTrack(t, cameraStream));
+    }
+  }, [localStream, cameraStream, isAdmin, streamData?.isActive]);
+
+  useEffect(() => {
+    if (!isAdmin || !streamData?.isActive) {
+      setActiveConnections(0);
+      return;
+    }
+
+    console.log("Broadcaster: [SIGNALING] Persistent Engine Started");
+    const startTime = Date.now();
+    // Use client-side timestamp for query filtering since serverTimestamp() is for writes only
+    const queryStartTime = new Date(startTime - 60000); // Look back 1 minute
+
+    // Broadcaster: [SIGNALING] Persistent Engine Started
+    const qRaw = query(collection(db, 'calls'));
+
+    const unsubscribe = onSnapshot(qRaw, (snapshot) => {
       snapshot.docChanges().forEach(async (change) => {
         if (change.type === 'added') {
           const callId = change.doc.id;
           const data = change.doc.data();
           
-          if (!data.offer && !pcs.current[callId]) {
-            console.log("Processing viewer connection request:", callId);
-            const pc = new RTCPeerConnection(ICE_SERVERS);
-            pcs.current[callId] = pc;
+          if (activePcs.current[callId]) return;
+          
+          // Relaxed freshness check: 2 minutes
+          const created = data.createdAt?.toMillis?.() || Date.now();
+          if (created < startTime - 120000) return; 
 
-            // Add all available tracks from refs (Broadcaster Side)
-            if (localStreamRef.current) {
-              localStreamRef.current.getTracks().forEach(track => pc.addTrack(track, localStreamRef.current!));
-            }
-            if (cameraStreamRef.current) {
-              cameraStreamRef.current.getTracks().forEach(track => pc.addTrack(track, cameraStreamRef.current!));
-            }
+          console.log(`Broadcaster: [PEER] Initializing ${callId}`);
+          const pc = new RTCPeerConnection(ICE_SERVERS);
+          activePcs.current[callId] = pc;
 
-            pc.onicecandidate = (event) => {
-              if (event.candidate) {
-                addDoc(collection(db, 'calls', callId, 'offerCandidates'), event.candidate.toJSON());
-              }
-            };
+          setActiveConnections(prev => prev + 1);
 
-            const offerDescription = await pc.createOffer();
-            await pc.setLocalDescription(offerDescription);
-
-            await updateDoc(doc(db, 'calls', callId), {
-              offer: { type: offerDescription.type, sdp: offerDescription.sdp }
-            });
-
-            // Listen for answer
-            onSnapshot(doc(db, 'calls', callId), async (docSnapshot) => {
-              const docData = docSnapshot.data();
-              if (pc.signalingState !== "closed" && !pc.currentRemoteDescription && docData?.answer) {
-                console.log("Received answer from viewer", callId);
-                await pc.setRemoteDescription(new RTCSessionDescription(docData.answer));
-              }
-            });
-
-            // Listen for viewer candidates
-            onSnapshot(collection(db, 'calls', callId, 'answerCandidates'), (candSnapshot) => {
-              candSnapshot.docChanges().forEach((candChange) => {
-                if (candChange.type === 'added' && pc.signalingState !== "closed") {
-                  pc.addIceCandidate(new RTCIceCandidate(candChange.doc.data()));
-                }
-              });
-            });
+          // Add existing tracks immediately
+          if (localStreamRef.current) {
+             localStreamRef.current.getTracks().forEach(t => pc.addTrack(t, localStreamRef.current!));
           }
+          if (cameraStreamRef.current) {
+             cameraStreamRef.current.getTracks().forEach(t => pc.addTrack(t, cameraStreamRef.current!));
+          }
+
+          pc.onicecandidate = (e) => {
+            if (e.candidate) addDoc(collection(db, 'calls', callId, 'offerCandidates'), eventToCandidate(e.candidate));
+          };
+
+          pc.onconnectionstatechange = () => {
+            console.log(`Broadcaster: Connection ${callId} is ${pc.connectionState}`);
+            if (['disconnected', 'closed', 'failed'].includes(pc.connectionState)) {
+              setActiveConnections(prev => Math.max(0, prev - 1));
+              delete activePcs.current[callId];
+            }
+          };
+
+          // Signalling
+          const offer = await pc.createOffer();
+          await pc.setLocalDescription(offer);
+          await updateDoc(doc(db, 'calls', callId), { 
+            offer: { type: offer.type, sdp: offer.sdp },
+            updatedAt: serverTimestamp()
+          });
+
+          // Listen for Answer
+          onSnapshot(doc(db, 'calls', callId), async (snap) => {
+            const sd = snap.data();
+            if (pc.signalingState === "have-local-offer" && sd?.answer) {
+              try {
+                await pc.setRemoteDescription(new RTCSessionDescription(sd.answer));
+                console.log(`Broadcaster: [SYNC] Handshake complete with ${callId}`);
+              } catch (err) {
+                console.error("SDP Answer Fail:", err);
+              }
+            }
+          });
+
+          // Listen for Candidates
+          onSnapshot(collection(db, 'calls', callId, 'answerCandidates'), (snap) => {
+            snap.docChanges().forEach(c => {
+              if (c.type === 'added' && pc.signalingState !== "closed") {
+                pc.addIceCandidate(new RTCIceCandidate(c.doc.data())).catch(e => console.warn("ICE add fail (answer)", e));
+              }
+            });
+          });
         }
       });
-    }, (err) => console.error("Admin Signaling Error:", err));
+    });
 
     return () => {
       unsubscribe();
-      (Object.values(pcs.current) as RTCPeerConnection[]).forEach(pc => pc.close());
-      pcs.current = {};
+      (Object.values(activePcs.current) as RTCPeerConnection[]).forEach(pc => pc.close());
+      activePcs.current = {};
+      setActiveConnections(0);
     };
   }, [isAdmin, streamData?.isActive]);
+
+  const eventToCandidate = (c: RTCIceCandidate) => ({
+    candidate: c.candidate,
+    sdpMid: c.sdpMid,
+    sdpMLineIndex: c.sdpMLineIndex
+  });
 
   // ==========================================
   // WebRTC Logic: Viewer
   // ==========================================
+  const [viewerStarted, setViewerStarted] = useState(false);
+
   useEffect(() => {
-    if (isAdmin || !streamData?.isActive) {
+    if (isAdmin || !streamData?.isActive || !viewerStarted) {
       setRemoteMainStream(null);
       setRemoteCameraStream(null);
       return;
@@ -165,77 +237,61 @@ export function StreamPlayer({ streamData, isAdmin }: StreamPlayerProps) {
 
     let pc: RTCPeerConnection | null = null;
     let callId: string | null = null;
-    let mainAssigned = false;
+    let vCount = 0;
 
-    const startViewerConnection = async () => {
-      console.log("Viewer initiating connection...");
+    const start = async () => {
+      console.log("Spectator: [INIT] Signal Engine");
       pc = new RTCPeerConnection(ICE_SERVERS);
-      
-      pc.ontrack = (event) => {
-        const stream = event.streams[0];
-        console.log("Viewer received track:", event.track.kind, "Stream ID:", stream.id);
-        
-        if (event.track.kind === 'audio') {
-           setRemoteCameraStream(stream);
+
+      pc.ontrack = (e) => {
+        const s = e.streams[0];
+        if (e.track.kind === 'audio') {
+          setRemoteMainStream(curr => (curr?.getAudioTracks().length ? curr : s));
         } else {
-           if (!mainAssigned) {
-              setRemoteMainStream(stream);
-              mainAssigned = true;
-           } else {
-              setRemoteCameraStream(stream);
-           }
+          if (vCount === 0) { setRemoteMainStream(s); vCount = 1; }
+          else { setRemoteCameraStream(s); vCount = 2; }
         }
       };
 
-      pc.oniceconnectionstatechange = () => {
-        console.log("ICE Connection State:", pc?.iceConnectionState);
+      pc.onicecandidate = (e) => {
+        if (e.candidate && callId) addDoc(collection(db, 'calls', callId, 'answerCandidates'), e.candidate.toJSON());
       };
 
-      pc.onicecandidate = (event) => {
-        if (event.candidate && callId) {
-          addDoc(collection(db, 'calls', callId, 'answerCandidates'), event.candidate.toJSON());
-        }
-      };
-
-      // 1. Create call document
-      const docRef = await addDoc(collection(db, 'calls'), {
+      const dr = await addDoc(collection(db, 'calls'), {
         createdAt: serverTimestamp(),
-        viewerId: Math.random().toString(36).substring(7)
+        spectatorId: Math.random().toString(36).substring(7)
       });
-      callId = docRef.id;
+      callId = dr.id;
 
-      // 2. Listen for offer
-      onSnapshot(doc(db, 'calls', callId), async (snapshot) => {
-        const data = snapshot.data();
-        if (pc && pc.signalingState !== "closed" && !pc.currentRemoteDescription && data?.offer) {
-          console.log("Viewer: Received offer from admin");
-          await pc.setRemoteDescription(new RTCSessionDescription(data.offer));
-
-          const answer = await pc.createAnswer();
-          await pc.setLocalDescription(answer);
-
-          await updateDoc(doc(db, 'calls', callId!), {
-            answer: { type: answer?.type, sdp: answer?.sdp }
-          });
+      onSnapshot(doc(db, 'calls', callId), async (snap) => {
+        const sd = snap.data();
+        if (pc && pc.signalingState !== "closed" && sd?.offer) {
+          try {
+             // Only set if different or if we are ready for a new offer
+             const isNewOffer = !pc.remoteDescription || pc.remoteDescription.sdp !== sd.offer.sdp;
+             if (isNewOffer) {
+                console.log("Spectator: Updating Signal Data...");
+                await pc.setRemoteDescription(new RTCSessionDescription(sd.offer));
+                const answer = await pc.createAnswer();
+                await pc.setLocalDescription(answer);
+                await updateDoc(doc(db, 'calls', callId!), { answer: { type: answer.type, sdp: answer.sdp } });
+             }
+          } catch (err) {
+             console.error("Spectator: Signal Sync Fail:", err);
+          }
         }
       });
 
-      // 3. Listen for admin candidates
-      onSnapshot(collection(db, 'calls', callId, 'offerCandidates'), (snapshot) => {
-        snapshot.docChanges().forEach((change) => {
-          if (change.type === 'added' && pc && pc.signalingState !== "closed") {
-            pc.addIceCandidate(new RTCIceCandidate(change.doc.data()));
-          }
+      onSnapshot(collection(db, 'calls', callId, 'offerCandidates'), (snap) => {
+        snap.docChanges().forEach(c => {
+          if (c.type === 'added' && pc && pc.signalingState !== "closed") pc.addIceCandidate(new RTCIceCandidate(c.doc.data()));
         });
       });
     };
 
-    startViewerConnection();
-
-    return () => {
-      if (pc) pc.close();
-    };
-  }, [isAdmin, streamData?.isActive]);
+    start();
+    return () => { if (pc) pc.close(); };
+  }, [isAdmin, streamData?.isActive, viewerStarted]);
 
   const [shareError, setShareError] = useState<string | null>(null);
 
@@ -350,29 +406,48 @@ export function StreamPlayer({ streamData, isAdmin }: StreamPlayerProps) {
             </div>
           )
         ) : (
-          <div id="viewer-placeholder" className="absolute inset-0 flex flex-col items-center justify-center bg-black">
+          <div id="viewer-placeholder" className="absolute inset-0 flex flex-col items-center justify-center bg-zinc-950">
             {streamData?.isActive ? (
-              remoteMainStream ? (
-                <video 
-                  id="viewer-remote-video"
-                  ref={viewerMainVideoRef} 
-                  autoPlay 
-                  playsInline 
-                  className="w-full h-full object-contain" 
-                />
+              !viewerStarted ? (
+                <div className="flex flex-col items-center gap-6 p-12 text-center max-w-md">
+                   <div className="w-20 h-20 bg-emerald-500/10 rounded-full flex items-center justify-center border border-emerald-500/20 mb-2">
+                      <Play className="w-8 h-8 text-emerald-500 fill-emerald-500" />
+                   </div>
+                   <div>
+                      <h3 className="text-xl font-black uppercase tracking-widest text-white mb-2">STREAM EN VIVO</h3>
+                      <p className="text-zinc-500 text-[10px] leading-relaxed font-bold uppercase tracking-widest">
+                         El administrador está transmitiendo. Pulsa el botón para sincronizar la señal de video y audio.
+                      </p>
+                   </div>
+                   <button 
+                    id="btn-sync-viewer"
+                    onClick={() => setViewerStarted(true)}
+                    className="w-full bg-emerald-500 hover:bg-emerald-400 text-black py-4 font-black uppercase tracking-[0.3em] text-[10px] transition-all shadow-[0_0_50px_rgba(16,185,129,0.3)] rounded-sm group flex items-center justify-center gap-3"
+                   >
+                    Sincronizar Señal <TrendingUp className="w-3 h-3 group-hover:translate-x-1 transition-transform" />
+                   </button>
+                </div>
+              ) : remoteMainStream ? (
+                <div className="relative w-full h-full">
+                  <video 
+                    id="viewer-remote-video"
+                    ref={viewerMainVideoRef} 
+                    autoPlay 
+                    playsInline 
+                    className="w-full h-full object-contain" 
+                  />
+                  <div className="absolute top-4 right-4 bg-emerald-500 text-black px-2 py-0.5 text-[8px] font-black uppercase tracking-widest rounded-sm animate-pulse">
+                    EN VIVO • SINCRONIZADO
+                  </div>
+                </div>
               ) : (
                 <div className="flex flex-col items-center gap-4">
                   <div className="w-20 h-20 rounded-full border-4 border-emerald-500 border-t-transparent animate-spin" />
                   <div className="text-center">
                     <span className="text-emerald-500 font-mono text-[10px] tracking-[0.2em] font-bold uppercase animate-pulse block mb-2">
-                       Sincronizando con el servidor...
+                       ESTABLECIENDO CONEXIÓN P2P...
                     </span>
-                    <button 
-                      onClick={() => window.location.reload()}
-                      className="text-zinc-500 hover:text-white text-[8px] uppercase tracking-widest font-bold underline transition-colors"
-                    >
-                      ¿Demasiado tiempo? Reintentar ahora
-                    </button>
+                    <p className="text-zinc-500 text-[8px] uppercase font-bold tracking-widest">Negociando señal con el administrador</p>
                   </div>
                 </div>
               )
@@ -472,6 +547,7 @@ export function StreamPlayer({ streamData, isAdmin }: StreamPlayerProps) {
                 ref={viewerPipVideoRef} 
                 autoPlay 
                 playsInline 
+                muted
                 className="w-full h-full object-cover" 
               />
             )}
