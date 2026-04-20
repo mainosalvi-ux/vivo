@@ -37,12 +37,16 @@ export function StreamPlayer({ streamData, isAdmin }: StreamPlayerProps) {
   // Storage for currently active streams to be used inside the signalling effect
   const localStreamRef = useRef<MediaStream | null>(null);
   const cameraStreamRef = useRef<MediaStream | null>(null);
+  const audioStreamRef = useRef<MediaStream | null>(null);
 
   useEffect(() => { localStreamRef.current = localStream; }, [localStream]);
   useEffect(() => { cameraStreamRef.current = cameraStream; }, [cameraStream]);
 
   // Broadcaster: Track statistics
   const [activeConnections, setActiveConnections] = useState(0);
+  const [audioStream, setAudioStream] = useState<MediaStream | null>(null);
+
+  useEffect(() => { audioStreamRef.current = audioStream; }, [audioStream]);
 
   // Sync main screen share
   useEffect(() => {
@@ -134,10 +138,11 @@ export function StreamPlayer({ streamData, isAdmin }: StreamPlayerProps) {
       let tracksChanged = false;
       const senders = pc.getSenders();
 
-      // Stable order: Screen share then Camera
+      // Stable order: Screen share then Camera then Audio
       const streamsToAdd = [
         { stream: localStream, label: 'screen' },
-        { stream: cameraStream, label: 'camera' }
+        { stream: cameraStream, label: 'camera' },
+        { stream: audioStream, label: 'audio' }
       ];
 
       streamsToAdd.forEach(({ stream }) => {
@@ -190,7 +195,7 @@ export function StreamPlayer({ streamData, isAdmin }: StreamPlayerProps) {
           setActiveConnections(prev => prev + 1);
 
           // Set up tracks immediately in stable order
-          const initialStreams = [localStreamRef.current, cameraStreamRef.current];
+          const initialStreams = [localStreamRef.current, cameraStreamRef.current, audioStreamRef.current];
           initialStreams.forEach(s => {
             if (s) s.getTracks().forEach(t => pc.addTrack(t, s));
           });
@@ -387,6 +392,11 @@ export function StreamPlayer({ streamData, isAdmin }: StreamPlayerProps) {
         audio: true 
       });
       console.log("Camera stream acquired", stream.getTracks().length);
+      
+      // Store audio separately to ensure it persists
+      const micAudio = new MediaStream(stream.getAudioTracks());
+      setAudioStream(micAudio);
+      
       setCameraStream(stream);
     } catch (err: any) {
       console.error("Error starting camera:", err);
