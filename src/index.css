@@ -1,0 +1,35 @@
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&display=swap');
+@import "tailwindcss";
+
+@theme {
+  --font-sans: "Inter", ui-sans-serif, system-ui, sans-serif;
+  --font-mono: "Courier New", Courier, monospace;
+}
+
+@layer base {
+  body {
+    @apply bg-[#09090b] text-[#fafafa] antialiased overflow-hidden;
+  }
+}
+
+@layer components {
+  .border-ui {
+    @apply border border-white/10;
+  }
+
+  .stat-value {
+    @apply font-mono text-[#22c55e];
+  }
+
+  .overlay-glass {
+    @apply bg-black/60 backdrop-blur-sm border border-white/20;
+  }
+}
+
+.scrollbar-hide::-webkit-scrollbar {
+  display: none;
+}
+.scrollbar-hide {
+  -ms-overflow-style: none;
+  scrollbar-width: none;
+}

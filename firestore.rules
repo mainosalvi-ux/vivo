@@ -1,0 +1,71 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // 0. Default Deny
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // Global Helpers
+    function isSignedIn() { return request.auth != null; }
+    function isVerified() { return request.auth.token.email_verified == true; }
+    function isAdmin() { return isSignedIn() && request.auth.token.email == 'mainosalvi@gmail.com'; }
+    function isValidId(id) { return id is string && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$'); }
+    function incoming() { return request.resource.data; }
+    function existing() { return resource.data; }
+
+    // 1. Stream Helper
+    function isValidStream(data) {
+      return (data.get('title', '') is string && data.get('title', '').size() <= 100) &&
+             (data.get('isActive', false) is bool) &&
+             (data.get('overlayText', '') is string && data.get('overlayText', '').size() <= 256) &&
+             (data.get('showCamera', false) is bool);
+    }
+
+    match /streams/main {
+      allow read: if true;
+      allow write: if isAdmin() && isValidStream(incoming());
+    }
+
+    // 2. Message Helper
+    function isValidMessage(data) {
+      return data.text is string && data.text.size() <= 500 &&
+             data.userId == request.auth.uid &&
+             data.userName is string && data.userName.size() <= 100 &&
+             data.timestamp == request.time;
+    }
+
+    match /messages/{messageId} {
+      allow list: if true;
+      allow get: if true;
+      allow create: if isSignedIn() && isValidId(messageId) && isValidMessage(incoming());
+      allow delete: if isAdmin() && isValidId(messageId);
+    }
+
+    // 3. Viewers Helper (Heartbeat)
+    function isValidViewer(data) {
+      return data.lastSeen == request.time;
+    }
+
+    match /viewers/{viewerId} {
+      allow list: if true;
+      allow read: if true;
+      allow create, update: if isValidId(viewerId) && isValidViewer(incoming());
+      allow delete: if false;
+    }
+
+    // 4. WebRTC Signaling (Calls & Candidates)
+    match /calls/{callId} {
+      allow list, read: if true; // Relaxed for signaling
+      allow create, update: if true;
+      allow delete: if isAdmin();
+      
+      match /offerCandidates/{candidateId} {
+        allow read, write: if true;
+      }
+      match /answerCandidates/{candidateId} {
+        allow read, write: if true;
+      }
+    }
+  }
+}
